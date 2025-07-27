@@ -2,7 +2,7 @@
 
 # ==================================================================================
 #
-#   APPLOOS FRP TUNNEL - Full Management Script (v65.0 - Final WSS Fix)
+#   APPLOOS FRP TUNNEL - Full Management Script (v67.0 - Final Mux/WSS Fix)
 #   Developed By: @AliTabari
 #   Purpose: Automate the installation, configuration, and management of FRP.
 #
@@ -42,7 +42,7 @@ get_server_ips() {
     return 0
 }
 get_port_input() {
-    echo -e "\n${CYAN}Please enter the port(s) to tunnel for BOTH TCP & UDP.${NC}"
+    echo -e "\n${CYAN}Please enter the port(s) you want to tunnel for BOTH TCP & UDP.${NC}"
     echo -e "Examples:\n  - A single port: ${YELLOW}8080${NC}\n  - A range: ${YELLOW}20000-30000${NC}\n  - A mix: ${YELLOW}80,443,9000-9100${NC}"
     read -p "Enter ports: " user_ports
     if [[ -z "$user_ports" ]]; then echo -e "${RED}No ports entered.${NC}"; return 1; fi
@@ -85,24 +85,21 @@ setup_iran_server() {
     get_server_ips && get_port_input && get_protocol_choice || return 1
     echo -e "\n${YELLOW}--- Setting up Iran Server (frps) ---${NC}"; stop_frp_processes; download_and_extract
     
+    local frps_config_file="${FRP_INSTALL_DIR}/frps.ini"
+    
     if [ "$FRP_PROTOCOL" == "wss" ]; then
-        echo -e "${YELLOW}--> WSS mode: Installing Nginx & Certbot...${NC}"; apt-get update -y > /dev/null && apt-get install nginx certbot python3-certbot-nginx -y > /dev/null
-        if [ $? -ne 0 ]; then echo -e "${RED}Failed to install Nginx/Certbot.${NC}"; return 1; fi
+        apt-get update -y > /dev/null && apt-get install nginx certbot python3-certbot-nginx -y > /dev/null
         systemctl stop nginx
-        echo -e "${YELLOW}--> Obtaining SSL certificate for ${FRP_DOMAIN}...${NC}";
         certbot certonly --standalone --agree-tos --non-interactive --email ${LETSENCRYPT_EMAIL} -d ${FRP_DOMAIN}
-        if [ $? -ne 0 ]; then echo -e "${RED}Failed to obtain SSL certificate. Check DNS and port 80.${NC}"; systemctl start nginx; return 1; fi
-        echo -e "${YELLOW}--> Configuring Nginx as a reverse proxy...${NC}"
+        if [ $? -ne 0 ]; then echo -e "${RED}Failed to obtain SSL certificate.${NC}"; systemctl start nginx; return 1; fi
         cat > /etc/nginx/sites-available/default << EOF
 server {
-    listen 80;
-    server_name ${FRP_DOMAIN};
+    listen 80; server_name ${FRP_DOMAIN};
     location /.well-known/acme-challenge/ { root /var/www/html; }
     location / { return 301 https://\$host\$request_uri; }
 }
 server {
-    listen 443 ssl http2;
-    server_name ${FRP_DOMAIN};
+    listen 443 ssl http2; server_name ${FRP_DOMAIN};
     ssl_certificate /etc/letsencrypt/live/${FRP_DOMAIN}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${FRP_DOMAIN}/privkey.pem;
     include /etc/letsencrypt/options-ssl-nginx.conf;
@@ -110,14 +107,12 @@ server {
     location / {
         proxy_pass http://127.0.0.1:${FRP_TCP_CONTROL_PORT};
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
+        proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host \$host;
     }
 }
 EOF
         systemctl restart nginx
-        cat > ${FRP_INSTALL_DIR}/frps.ini << EOF
+        cat > ${frps_config_file} << EOF
 [common]
 vhost_http_port = ${FRP_TCP_CONTROL_PORT}
 subdomain_host = ${FRP_DOMAIN}
@@ -127,28 +122,25 @@ dashboard_user = admin
 dashboard_pwd = FRP_PASSWORD_123
 EOF
     else
-        cat > ${FRP_INSTALL_DIR}/frps.ini << EOF
+        cat > ${frps_config_file} << EOF
 [common]
-bind_port = ${FRP_TCP_CONTROL_PORT}
-kcp_bind_port = ${FRP_KCP_CONTROL_PORT}
-quic_bind_port = ${FRP_QUIC_CONTROL_PORT}
 dashboard_addr = 0.0.0.0
 dashboard_port = ${FRP_DASHBOARD_PORT}
 dashboard_user = admin
 dashboard_pwd = FRP_PASSWORD_123
-tcp_mux = ${TCP_MUX}
 EOF
+        if [[ "$TCP_MUX" == "true" ]]; then echo "tcp_mux = true" >> ${frps_config_file}; fi
+        if [[ "$FRP_PROTOCOL" == "tcp" || "$FRP_PROTOCOL" == "kcp" || "$FRP_PROTOCOL" == "quic" ]]; then echo "bind_port = ${FRP_TCP_CONTROL_PORT}" >> ${frps_config_file}; fi
+        if [[ "$FRP_PROTOCOL" == "kcp" ]]; then echo "kcp_bind_port = ${FRP_KCP_CONTROL_PORT}" >> ${frps_config_file}; fi
+        if [[ "$FRP_PROTOCOL" == "quic" ]]; then echo "quic_bind_port = ${FRP_QUIC_CONTROL_PORT}" >> ${frps_config_file}; fi
     fi
-
-    echo -e "${YELLOW}--> Setting up firewall...${NC}";
-    if [[ "$FRP_PROTOCOL" == "tcp" ]]; then ufw allow ${FRP_TCP_CONTROL_PORT}/tcp > /dev/null; fi
-    if [[ "$FRP_PROTOCOL" == "kcp" ]]; then ufw allow ${FRP_TCP_CONTROL_PORT}/tcp > /dev/null; ufw allow ${FRP_KCP_CONTROL_PORT}/udp > /dev/null; fi
-    if [[ "$FRP_PROTOCOL" == "quic" ]]; then ufw allow ${FRP_TCP_CONTROL_PORT}/tcp > /dev/null; ufw allow ${FRP_QUIC_CONTROL_PORT}/udp > /dev/null; fi
+    ufw allow ${FRP_TCP_CONTROL_PORT}/tcp > /dev/null
+    if [[ "$FRP_PROTOCOL" == "kcp" ]]; then ufw allow ${FRP_KCP_CONTROL_PORT}/udp > /dev/null; fi
+    if [[ "$FRP_PROTOCOL" == "quic" ]]; then ufw allow ${FRP_QUIC_CONTROL_PORT}/udp > /dev/null; fi
     if [[ "$FRP_PROTOCOL" == "wss" ]]; then ufw allow 80/tcp > /dev/null; ufw allow 443/tcp > /dev/null; else ufw allow ${FRP_DASHBOARD_PORT}/tcp > /dev/null; fi
     OLD_IFS=$IFS; IFS=','; read -ra PORTS_ARRAY <<< "$FRP_TUNNEL_PORTS_UFW"; IFS=$OLD_IFS
     for port in "${PORTS_ARRAY[@]}"; do ufw allow "$port"/tcp > /dev/null; ufw allow "$port"/udp > /dev/null; done
     ufw reload > /dev/null
-    
     cat > ${SYSTEMD_DIR}/frps.service << EOF
 [Unit]
 Description=FRP Server (frps)
@@ -159,7 +151,7 @@ Type=simple
 User=root
 Restart=on-failure
 RestartSec=5s
-ExecStart=${FRP_INSTALL_DIR}/frps -c ${FRP_INSTALL_DIR}/frps.ini
+ExecStart=${FRP_INSTALL_DIR}/frps -c ${frps_config_file}
 
 [Install]
 WantedBy=multi-user.target
@@ -170,15 +162,14 @@ EOF
 setup_foreign_server() {
     get_server_ips && get_port_input && get_protocol_choice || return 1
     echo -e "\n${YELLOW}--- Setting up Foreign Server (frpc) ---${NC}"; stop_frp_processes; download_and_extract
-    cat > ${FRP_INSTALL_DIR}/frpc.ini << EOF
+    local frpc_config_file="${FRP_INSTALL_DIR}/frpc.ini"
+    cat > ${frpc_config_file} << EOF
 [common]
 server_addr = ${IRAN_SERVER_IP}
-tcp_mux = ${TCP_MUX}
 EOF
-    if [[ "$FRP_PROTOCOL" == "tcp" || "$FRP_PROTOCOL" == "kcp" || "$FRP_PROTOCOL" == "quic" ]]; then echo "server_port = ${FRP_TCP_CONTROL_PORT}" >> ${FRP_INSTALL_DIR}/frpc.ini; fi
-    case $FRP_PROTOCOL in "kcp") echo "transport.protocol = kcp" >> ${FRP_INSTALL_DIR}/frpc.ini ;; "quic") echo "transport.protocol = quic" >> ${FRP_INSTALL_DIR}/frpc.ini ;; "wss") echo "server_port = 443" >> ${FRP_INSTALL_DIR}/frpc.ini; echo "transport.protocol = wss" >> ${FRP_INSTALL_DIR}/frpc.ini; echo "tls_enable = true" >> ${FRP_INSTALL_DIR}/frpc.ini; echo "server_name = ${FRP_DOMAIN}" >> ${FRP_INSTALL_DIR}/frpc.ini ;; esac
-    
-    cat >> ${FRP_INSTALL_DIR}/frpc.ini << EOF
+    if [[ "$TCP_MUX" == "true" ]]; then echo "tcp_mux = true" >> ${frpc_config_file}; fi
+    case $FRP_PROTOCOL in "tcp") echo "server_port = ${FRP_TCP_CONTROL_PORT}" >> ${frpc_config_file} ;; "kcp") echo -e "server_port = ${FRP_KCP_CONTROL_PORT}\ntransport.protocol = kcp" >> ${frpc_config_file} ;; "quic") echo -e "server_port = ${FRP_QUIC_CONTROL_PORT}\ntransport.protocol = quic" >> ${frpc_config_file} ;; "wss") echo -e "server_port = 443\ntransport.protocol = wss\ntls_enable = true\nserver_name = ${FRP_DOMAIN}" >> ${frpc_config_file} ;; esac
+    cat >> ${frpc_config_file} << EOF
 
 [range:tcp_proxies]
 type = tcp
@@ -202,7 +193,7 @@ Type=simple
 User=root
 Restart=on-failure
 RestartSec=5s
-ExecStart=${FRP_INSTALL_DIR}/frpc -c ${FRP_INSTALL_DIR}/frpc.ini
+ExecStart=${FRP_INSTALL_DIR}/frpc -c ${frpc_config_file}
 
 [Install]
 WantedBy=multi-user.target
@@ -221,7 +212,7 @@ uninstall_frp() {
 main_menu() {
     while true; do
         clear; CURRENT_SERVER_IP=$(wget -qO- 'https://api.ipify.org' || echo "N/A")
-        echo "================================================="; echo -e "      ${CYAN}APPLOOS FRP TUNNEL${NC} - v65.0"; echo "================================================="
+        echo "================================================="; echo -e "      ${CYAN}APPLOOS FRP TUNNEL${NC} - v67.0"; echo "================================================="
         echo -e "  Developed By ${YELLOW}@AliTabari${NC}"; echo -e "  This Server's Public IP: ${GREEN}${CURRENT_SERVER_IP}${NC}"; check_install_status
         echo "-------------------------------------------------"; echo "  1. Setup/Reconfigure FRP Tunnel"; echo "  2. Uninstall FRP"; echo "  3. Exit"; echo "-------------------------------------------------"
         read -p "Enter your choice [1-3]: " choice
