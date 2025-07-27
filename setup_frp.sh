@@ -2,7 +2,7 @@
 
 # ==================================================================================
 #
-#   APPLOOS FRP TUNNEL - Full Management Script (v71.2 - Final KCP/QUIC Fix)
+#   APPLOOS FRP TUNNEL - Full Management Script (v71.3 - Final QUIC Fix)
 #   Developed By: @AliTabari
 #   Purpose: Automate the installation, configuration, and management of FRP.
 #
@@ -183,9 +183,9 @@ setup_foreign_server() {
     if [[ "$FRP_PROTOCOL" == "tcp" || "$FRP_PROTOCOL" == "kcp" ]]; then frpc_config+="\ntcp_mux = ${TCP_MUX}"; fi
     case $FRP_PROTOCOL in
         "tcp") frpc_config+="\nserver_port = ${FRP_TCP_CONTROL_PORT}" ;;
-        # اصلاحیه: server_port باید به FRP_TCP_CONTROL_PORT باشد، نه پورت KCP/QUIC
         "kcp") frpc_config+="\nserver_port = ${FRP_TCP_CONTROL_PORT}\ntransport.protocol = kcp" ;;
-        "quic") frpc_config+="\nserver_port = ${FRP_TCP_CONTROL_PORT}\ntransport.protocol = quic" ;;
+        # اصلاحیه برای QUIC: اضافه کردن tls_verify_server_cert = false
+        "quic") frpc_config+="\nserver_port = ${FRP_TCP_CONTROL_PORT}\ntransport.protocol = quic\ntls_verify_server_cert = false" ;;
         "wss") frpc_config+="\nserver_port = 443\ntransport.protocol = wss\ntls_enable = true\nserver_name = ${FRP_DOMAIN}" ;;
     esac
     
@@ -209,7 +209,7 @@ uninstall_frp() {
 main_menu() {
     while true; do
         clear; CURRENT_SERVER_IP=$(wget -qO- 'https://api.ipify.org' || echo "N/A")
-        echo "================================================="; echo -e "      ${CYAN}APPLOOS FRP TUNNEL${NC} - v71.2"; echo "================================================="
+        echo "================================================="; echo -e "      ${CYAN}APPLOOS FRP TUNNEL${NC} - v71.3"; echo "================================================="
         echo -e "  Developed By ${YELLOW}@AliTabari${NC}"; echo -e "  This Server's Public IP: ${GREEN}${CURRENT_SERVER_IP}${NC}"; check_install_status
         echo "-------------------------------------------------"; echo "  1. Setup/Reconfigure FRP Tunnel"; echo "  2. Uninstall FRP"; echo "  3. Exit"; echo "-------------------------------------------------"
         read -p "Enter your choice [1-3]: " choice
