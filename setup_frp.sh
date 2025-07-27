@@ -2,7 +2,7 @@
 
 # ==================================================================================
 #
-#   APPLOOS FRP TUNNEL - Full Management Script (v71.5 - QUIC Fix)
+#   APPLOOS FRP TUNNEL - Full Management Script (v71.5 - Final KCP/QUIC Fix)
 #   Developed By: @AliTabari
 #   Purpose: Automate the installation, configuration, and management of FRP.
 #
@@ -58,17 +58,22 @@ get_protocol_choice() {
     echo "  4. WSS (Max stealth, requires domain & auto-installs Nginx)"
     read -p "Enter your choice [1-4]: " proto_choice
     case $proto_choice in 2) FRP_PROTOCOL="kcp" ;; 3) FRP_PROTOCOL="quic" ;; 4) FRP_PROTOCOL="wss" ;; *) FRP_PROTOCOL="tcp" ;; esac
+    
+    # Common settings for WSS that need domain/email
     if [[ "$FRP_PROTOCOL" == "wss" ]]; then
         read -p "Enter your domain pointed to the Iran server (e.g., frp.yourdomain.com): " FRP_DOMAIN
         if [[ -z "$FRP_DOMAIN" ]]; then echo -e "${RED}Domain cannot be empty for WSS.${NC}"; return 1; fi
         read -p "Enter your email address (for SSL renewal notices): " LETSENCRYPT_EMAIL
         if [[ -z "$LETSENCRYPT_EMAIL" ]]; then echo -e "${RED}Email cannot be empty for SSL certificates.${NC}"; return 1; fi
     fi
-    TCP_MUX="false"
-    if [[ "$FRP_PROTOCOL" == "tcp" || "$FRP_PROTOCOL" == "kcp" ]]; then
+
+    # TCP_MUX setting (now globally applied based on protocol choice)
+    TCP_MUX="false" # Default to false
+    if [[ "$FRP_PROTOCOL" == "tcp" || "$FRP_PROTOCOL" == "kcp" || "$FRP_PROTOCOL" == "quic" ]]; then # Apply tcpmux for these protocols
         read -p $'\n'"Enable TCP Multiplexer (tcpmux) for better performance? [y/N]: " mux_choice
         if [[ "$mux_choice" =~ ^[Yy]$ ]]; then TCP_MUX="true"; fi
     fi
+    # Note: For WSS, TCP_MUX is implicitly true as it relies on HTTP/WS multiplexing, but FRP's tcp_mux setting is not directly used for WSS transport.
 }
 
 # --- Core Logic Functions ---
@@ -87,6 +92,7 @@ setup_iran_server() {
     get_server_ips && get_port_input && get_protocol_choice || return 1
     echo -e "\n${YELLOW}--- Setting up Iran Server (frps) ---${NC}"; stop_frp_processes; download_and_extract
     
+    # Nginx and Certbot installation for WSS
     if [ "$FRP_PROTOCOL" == "wss" ]; then
         echo -e "${YELLOW}--> WSS mode: Installing prerequisites...${NC}"
         apt-get update -y > /dev/null
@@ -138,6 +144,8 @@ server {
 }
 EOF
         systemctl start nginx
+        
+        # frps.ini for WSS
         cat > ${FRP_INSTALL_DIR}/frps.ini << EOF
 [common]
 vhost_http_port = ${FRP_TCP_CONTROL_PORT}
@@ -146,8 +154,13 @@ dashboard_addr = 127.0.0.1
 dashboard_port = ${FRP_DASHBOARD_PORT}
 dashboard_user = admin
 dashboard_pwd = FRP_PASSWORD_123
+log_file = /var/log/frps.log
+log_level = info # Added log_level for WSS
+log_max_days = 3
+token = ${FRP_TOKEN} # Added token for WSS
 EOF
     else
+        # frps.ini for TCP, KCP, QUIC
         cat > ${FRP_INSTALL_DIR}/frps.ini << EOF
 [common]
 bind_port = ${FRP_TCP_CONTROL_PORT}
@@ -157,19 +170,44 @@ dashboard_addr = 0.0.0.0
 dashboard_port = ${FRP_DASHBOARD_PORT}
 dashboard_user = admin
 dashboard_pwd = FRP_PASSWORD_123
-tcp_mux = ${TCP_MUX}
+log_file = /var/log/frps.log
+log_level = info # Changed to info for general logging
+log_max_days = 3
+token = ${FRP_TOKEN}
+allow_ports = ${REMOTE_PROXY_START_PORT}-${REMOTE_PROXY_END_PORT} # Proxy port range to allow
+max_pool_count = 5
+tls_enable = false
+tcp_mux = ${TCP_MUX} # Active TCP Multiplexing based on user choice
 EOF
     fi
 
     echo -e "${YELLOW}--> Setting up firewall...${NC}";
-    if [[ "$FRP_PROTOCOL" == "tcp" || "$FRP_PROTOCOL" == "kcp" || "$FRP_PROTOCOL" == "quic" ]]; then ufw allow ${FRP_TCP_CONTROL_PORT}/tcp > /dev/null; fi
-    if [[ "$FRP_PROTOCOL" == "kcp" ]]; then ufw allow ${FRP_KCP_CONTROL_PORT}/udp > /dev/null; fi
-    if [[ "$FRP_PROTOCOL" == "quic" ]]; then ufw allow ${FRP_QUIC_CONTROL_PORT}/udp > /dev/null; fi
-    if [[ "$FRP_PROTOCOL" == "wss" ]]; then ufw allow 80/tcp > /dev/null; ufw allow 443/tcp > /dev/null; else ufw allow ${FRP_DASHBOARD_PORT}/tcp > /dev/null; fi
+    # UFW port opening logic
+    ufw allow ${FRP_DASHBOARD_PORT}/tcp > /dev/null # Dashboard always needed
+    
+    if [[ "$FRP_PROTOCOL" == "tcp" || "$FRP_PROTOCOL" == "kcp" || "$FRP_PROTOCOL" == "quic" ]]; then 
+        ufw allow ${FRP_TCP_CONTROL_PORT}/tcp > /dev/null; 
+    fi
+    if [[ "$FRP_PROTOCOL" == "kcp" ]]; then 
+        ufw allow ${FRP_KCP_CONTROL_PORT}/udp > /dev/null; 
+    fi
+    if [[ "$FRP_PROTOCOL" == "quic" ]]; then 
+        ufw allow ${FRP_QUIC_CONTROL_PORT}/udp > /dev/null; 
+    fi
+    if [[ "$FRP_PROTOCOL" == "wss" ]]; then 
+        ufw allow 80/tcp > /dev/null; 
+        ufw allow 443/tcp > /dev/null; 
+    fi
+    
+    # Allow user-specified tunnel ports
     OLD_IFS=$IFS; IFS=','; read -ra PORTS_ARRAY <<< "$FRP_TUNNEL_PORTS_UFW"; IFS=$OLD_IFS
-    for port in "${PORTS_ARRAY[@]}"; do ufw allow "$port"/tcp > /dev/null; ufw allow "$port"/udp > /dev/null; done
+    for port in "${PORTS_ARRAY[@]}"; do 
+        ufw allow "$port"/tcp > /dev/null; 
+        ufw allow "$port"/udp > /dev/null; 
+    done
     ufw reload > /dev/null
     
+    # Systemd service creation for frps
     local service_config="[Unit]\nDescription=FRP Server (frps)\nAfter=network.target\n\n[Service]\nType=simple\nUser=root\nRestart=on-failure\nRestartSec=5s\nExecStart=${FRP_INSTALL_DIR}/frps -c ${FRP_INSTALL_DIR}/frps.ini\n\n[Install]\nWantedBy=multi-user.target"
     echo -e "${service_config}" > ${SYSTEMD_DIR}/frps.service
     systemctl daemon-reload; systemctl enable frps.service > /dev/null; systemctl restart frps.service
@@ -179,14 +217,26 @@ setup_foreign_server() {
     get_server_ips && get_port_input && get_protocol_choice || return 1
     echo -e "\n${YELLOW}--- Setting up Foreign Server (frpc) ---${NC}"; stop_frp_processes; download_and_extract
     
-    local frpc_config="[common]\nserver_addr = ${IRAN_SERVER_IP}"
-    if [[ "$FRP_PROTOCOL" == "tcp" || "$FRP_PROTOCOL" == "kcp" ]]; then frpc_config+="\ntcp_mux = ${TCP_MUX}"; fi
+    local frpc_config="[common]\nserver_addr = ${IRAN_SERVER_IP}\nlog_file = /var/log/frpc.log\nlog_level = info\nlog_max_days = 3\ntoken = ${FRP_TOKEN}" # Common settings
+    
+    # Protocol-specific common settings
+    if [[ "$FRP_PROTOCOL" == "tcp" || "$FRP_PROTOCOL" == "kcp" || "$FRP_PROTOCOL" == "quic" ]]; then 
+        frpc_config+="\nserver_port = ${FRP_TCP_CONTROL_PORT}\ntcp_mux = ${TCP_MUX}" # TCP_MUX based on user choice
+    fi
+
     case $FRP_PROTOCOL in
-        "tcp") frpc_config+="\nserver_port = ${FRP_TCP_CONTROL_PORT}" ;;
-        "kcp") frpc_config+="\nserver_port = ${FRP_TCP_CONTROL_PORT}\ntransport.protocol = kcp" ;;
-        # اصلاحیه برای QUIC: تغییر server_port به پورت کنترل TCP (7000)
-        "quic") frpc_config+="\nserver_port = ${FRP_TCP_CONTROL_PORT}\ntransport.protocol = quic\ntls_verify_server_cert = false" ;;
-        "wss") frpc_config+="\nserver_port = 443\ntransport.protocol = wss\ntls_enable = true\nserver_name = ${FRP_DOMAIN}" ;;
+        "tcp") 
+            frpc_config+="\ntransport.protocol = tcp" 
+            ;;
+        "kcp") 
+            frpc_config+="\ntransport.protocol = kcp\nmtu = 1280" # mtud added back for KCP as it was there originally
+            ;;
+        "quic") 
+            frpc_config+="\ntransport.protocol = quic\nmtu = 1280\ntls_verify_server_cert = false" # mtud and tls_verify_server_cert added back for QUIC
+            ;;
+        "wss") 
+            frpc_config+="\nserver_port = 443\ntransport.protocol = wss\ntls_enable = true\nserver_name = ${FRP_DOMAIN}" 
+            ;;
     esac
     
     frpc_config+="\n\n[range:tcp_proxies]\ntype = tcp\nlocal_ip = 127.0.0.1\nlocal_port = ${FRP_TUNNEL_PORTS_FRP}\nremote_port = ${FRP_TUNNEL_PORTS_FRP}"
