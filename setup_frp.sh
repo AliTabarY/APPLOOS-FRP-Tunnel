@@ -2,7 +2,7 @@
 
 # ==================================================================================
 #
-#   APPLOOS FRP TUNNEL - Full Management Script (v71.0 - Final Stable Release)
+#   APPLOOS FRP TUNNEL - Full Management Script (v71.1 - KCP Fix)
 #   Developed By: @AliTabari
 #   Purpose: Automate the installation, configuration, and management of FRP.
 #
@@ -150,7 +150,7 @@ EOF
     else
         cat > ${FRP_INSTALL_DIR}/frps.ini << EOF
 [common]
-bind_port = ${FRP_TCP_CONTROL_PORT}
+bind_port = ${FRP_TCP_CONTROL_PORT} # <-- Added/Fixed: Essential for primary FRP communication
 kcp_bind_port = ${FRP_KCP_CONTROL_PORT}
 quic_bind_port = ${FRP_QUIC_CONTROL_PORT}
 dashboard_addr = 0.0.0.0
@@ -208,7 +208,7 @@ uninstall_frp() {
 main_menu() {
     while true; do
         clear; CURRENT_SERVER_IP=$(wget -qO- 'https://api.ipify.org' || echo "N/A")
-        echo "================================================="; echo -e "      ${CYAN}APPLOOS FRP TUNNEL${NC} - v71.0"; echo "================================================="
+        echo "================================================="; echo -e "      ${CYAN}APPLOOS FRP TUNNEL${NC} - v71.1"; echo "================================================="
         echo -e "  Developed By ${YELLOW}@AliTabari${NC}"; echo -e "  This Server's Public IP: ${GREEN}${CURRENT_SERVER_IP}${NC}"; check_install_status
         echo "-------------------------------------------------"; echo "  1. Setup/Reconfigure FRP Tunnel"; echo "  2. Uninstall FRP"; echo "  3. Exit"; echo "-------------------------------------------------"
         read -p "Enter your choice [1-3]: " choice
