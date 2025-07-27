@@ -2,7 +2,7 @@
 
 # ==================================================================================
 #
-#   APPLOOS FRP TUNNEL - Full Management Script (v62.0 - Final Corrected Logic)
+#   APPLOOS FRP TUNNEL - Full Management Script (v63.0 - Final Nginx/SSL Fix)
 #   Developed By: @AliTabari
 #   Purpose: Automate the installation, configuration, and management of FRP.
 #
@@ -17,6 +17,8 @@ FRP_KCP_CONTROL_PORT="7002"
 FRP_QUIC_CONTROL_PORT="7001"
 FRP_DASHBOARD_PORT="7500"
 XUI_PANEL_PORT="54333"
+SSL_OPTIONS_FILE="/etc/letsencrypt/options-ssl-nginx.conf"
+SSL_DHPARAMS_FILE="/etc/letsencrypt/ssl-dhparams.pem"
 
 # --- Color Codes ---
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -83,15 +85,32 @@ setup_iran_server() {
     get_server_ips && get_port_input && get_protocol_choice || return 1
     echo -e "\n${YELLOW}--- Setting up Iran Server (frps) ---${NC}"; stop_frp_processes; download_and_extract
     
-    # Build frps.ini content in a variable
-    local frps_config
     if [ "$FRP_PROTOCOL" == "wss" ]; then
-        echo -e "${YELLOW}--> WSS mode: Installing Nginx & Certbot...${NC}"; apt-get update -y > /dev/null && apt-get install nginx certbot python3-certbot-nginx -y > /dev/null
+        echo -e "${YELLOW}--> WSS mode: Installing Nginx, Certbot & OpenSSL...${NC}"; apt-get update -y > /dev/null && apt-get install nginx certbot python3-certbot-nginx openssl -y > /dev/null
+        if [ $? -ne 0 ]; then echo -e "${RED}Failed to install prerequisites.${NC}"; return 1; fi
         systemctl stop nginx
         echo -e "${YELLOW}--> Obtaining SSL certificate for ${FRP_DOMAIN}...${NC}";
         certbot certonly --standalone --agree-tos --non-interactive --email you@example.com -d ${FRP_DOMAIN}
         if [ $? -ne 0 ]; then echo -e "${RED}Failed to obtain SSL certificate. Check DNS and port 80.${NC}"; systemctl start nginx; return 1; fi
-        echo -e "${YELLOW}--> Configuring Nginx...${NC}"
+        
+        echo -e "${YELLOW}--> Creating SSL security files...${NC}"
+        if [ ! -f "${SSL_OPTIONS_FILE}" ]; then
+            echo -e "--> Creating ${SSL_OPTIONS_FILE}...${NC}"
+            tee ${SSL_OPTIONS_FILE} > /dev/null <<'EOF'
+ssl_session_cache shared:le_nginx_SSL:10m;
+ssl_session_timeout 1440m;
+ssl_session_tickets off;
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_prefer_server_ciphers off;
+ssl_ciphers "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384";
+EOF
+        fi
+        if [ ! -f "${SSL_DHPARAMS_FILE}" ]; then
+            echo -e "--> Generating ${SSL_DHPARAMS_FILE} (this may take a minute)...${NC}"
+            openssl dhparam -out ${SSL_DHPARAMS_FILE} 2048 > /dev/null 2>&1
+        fi
+
+        echo -e "${YELLOW}--> Configuring Nginx as a reverse proxy...${NC}"
         cat > /etc/nginx/sites-available/default << EOF
 server {
     listen 80; server_name ${FRP_DOMAIN};
@@ -102,8 +121,8 @@ server {
     listen 443 ssl http2; server_name ${FRP_DOMAIN};
     ssl_certificate /etc/letsencrypt/live/${FRP_DOMAIN}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${FRP_DOMAIN}/privkey.pem;
-    include /etc/letsencrypt/options-ssl-nginx.conf;
-    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+    include ${SSL_OPTIONS_FILE};
+    ssl_dhparam ${SSL_DHPARAMS_FILE};
     location / {
         proxy_pass http://127.0.0.1:${FRP_TCP_CONTROL_PORT};
         proxy_http_version 1.1;
@@ -112,18 +131,33 @@ server {
 }
 EOF
         systemctl restart nginx
-        frps_config="[common]\nvhost_http_port = ${FRP_TCP_CONTROL_PORT}\nsubdomain_host = ${FRP_DOMAIN}\ndashboard_addr = 127.0.0.1\ndashboard_port = ${FRP_DASHBOARD_PORT}\ndashboard_user = admin\ndashboard_pwd = FRP_PASSWORD_123"
+        cat > ${FRP_INSTALL_DIR}/frps.ini << EOF
+[common]
+vhost_http_port = ${FRP_TCP_CONTROL_PORT}
+subdomain_host = ${FRP_DOMAIN}
+dashboard_addr = 127.0.0.1
+dashboard_port = ${FRP_DASHBOARD_PORT}
+dashboard_user = admin
+dashboard_pwd = FRP_PASSWORD_123
+EOF
     else
-        frps_config="[common]\nbind_port = ${FRP_TCP_CONTROL_PORT}\ndashboard_addr = 0.0.0.0\ndashboard_port = ${FRP_DASHBOARD_PORT}\ndashboard_user = admin\ndashboard_pwd = FRP_PASSWORD_123\ntcp_mux = ${TCP_MUX}"
+        cat > ${FRP_INSTALL_DIR}/frps.ini << EOF
+[common]
+bind_port = ${FRP_TCP_CONTROL_PORT}
+dashboard_addr = 0.0.0.0
+dashboard_port = ${FRP_DASHBOARD_PORT}
+dashboard_user = admin
+dashboard_pwd = FRP_PASSWORD_123
+tcp_mux = ${TCP_MUX}
+EOF
         if [[ "$FRP_PROTOCOL" == "kcp" ]]; then frps_config+="\nkcp_bind_port = ${FRP_KCP_CONTROL_PORT}"; fi
         if [[ "$FRP_PROTOCOL" == "quic" ]]; then frps_config+="\nquic_bind_port = ${FRP_QUIC_CONTROL_PORT}"; fi
     fi
-    echo -e "${frps_config}" > ${FRP_INSTALL_DIR}/frps.ini
-    
+
     echo -e "${YELLOW}--> Setting up firewall...${NC}";
     if [[ "$FRP_PROTOCOL" == "tcp" ]]; then ufw allow ${FRP_TCP_CONTROL_PORT}/tcp > /dev/null; fi
-    if [[ "$FRP_PROTOCOL" == "kcp" ]]; then ufw allow ${FRP_TCP_CONTROL_PORT}/tcp > /dev/null; ufw allow ${FRP_KCP_CONTROL_PORT}/udp > /dev/null; fi # KCP needs both
-    if [[ "$FRP_PROTOCOL" == "quic" ]]; then ufw allow ${FRP_TCP_CONTROL_PORT}/tcp > /dev/null; ufw allow ${FRP_QUIC_CONTROL_PORT}/udp > /dev/null; fi # QUIC needs both
+    if [[ "$FRP_PROTOCOL" == "kcp" ]]; then ufw allow ${FRP_TCP_CONTROL_PORT}/tcp > /dev/null; ufw allow ${FRP_KCP_CONTROL_PORT}/udp > /dev/null; fi
+    if [[ "$FRP_PROTOCOL" == "quic" ]]; then ufw allow ${FRP_TCP_CONTROL_PORT}/tcp > /dev/null; ufw allow ${FRP_QUIC_CONTROL_PORT}/udp > /dev/null; fi
     if [[ "$FRP_PROTOCOL" == "wss" ]]; then ufw allow 80/tcp > /dev/null; ufw allow 443/tcp > /dev/null; else ufw allow ${FRP_DASHBOARD_PORT}/tcp > /dev/null; fi
     OLD_IFS=$IFS; IFS=','; read -ra PORTS_ARRAY <<< "$FRP_TUNNEL_PORTS_UFW"; IFS=$OLD_IFS
     for port in "${PORTS_ARRAY[@]}"; do ufw allow "$port"/tcp > /dev/null; ufw allow "$port"/udp > /dev/null; done
@@ -139,13 +173,8 @@ setup_foreign_server() {
     echo -e "\n${YELLOW}--- Setting up Foreign Server (frpc) ---${NC}"; stop_frp_processes; download_and_extract
     
     local frpc_config="[common]\nserver_addr = ${IRAN_SERVER_IP}\ntcp_mux = ${TCP_MUX}"
-    # CORRECTED LOGIC: KCP and QUIC clients connect to their dedicated UDP ports
-    case $FRP_PROTOCOL in
-        "tcp") frpc_config+="\nserver_port = ${FRP_TCP_CONTROL_PORT}" ;;
-        "kcp") frpc_config+="\nserver_port = ${FRP_KCP_CONTROL_PORT}\ntransport.protocol = kcp" ;;
-        "quic") frpc_config+="\nserver_port = ${FRP_QUIC_CONTROL_PORT}\ntransport.protocol = quic" ;;
-        "wss") frpc_config+="\nserver_port = 443\ntransport.protocol = wss\ntls_enable = true\nserver_name = ${FRP_DOMAIN}" ;;
-    esac
+    if [[ "$FRP_PROTOCOL" == "tcp" || "$FRP_PROTOCOL" == "kcp" || "$FRP_PROTOCOL" == "quic" ]]; then frpc_config+="\nserver_port = ${FRP_TCP_CONTROL_PORT}"; fi
+    case $FRP_PROTOCOL in "kcp") frpc_config+="\ntransport.protocol = kcp" ;; "quic") frpc_config+="\ntransport.protocol = quic" ;; "wss") frpc_config+="\nserver_port = 443\ntransport.protocol = wss\ntls_enable = true\nserver_name = ${FRP_DOMAIN}" ;; esac
     
     frpc_config+="\n\n[range:tcp_proxies]\ntype = tcp\nlocal_ip = 127.0.0.1\nlocal_port = ${FRP_TUNNEL_PORTS_FRP}\nremote_port = ${FRP_TUNNEL_PORTS_FRP}"
     frpc_config+="\n\n[range:udp_proxies]\ntype = udp\nlocal_ip = 127.0.0.1\nlocal_port = ${FRP_TUNNEL_PORTS_FRP}\nremote_port = ${FRP_TUNNEL_PORTS_FRP}"
@@ -160,14 +189,14 @@ uninstall_frp() {
     echo -e "\n${YELLOW}Uninstalling FRP...${NC}"; stop_frp_processes
     systemctl disable frps.service > /dev/null 2>&1; systemctl disable frpc.service > /dev/null 2>&1
     rm -f ${SYSTEMD_DIR}/frps.service; rm -f ${SYSTEMD_DIR}/frpc.service
-    systemctl daemon-reload; rm -rf ${FRP_INSTALL_DIR}
-    if [ -d "/etc/nginx" ]; then if [ -f "/etc/nginx/sites-available/default.bak" ]; then mv /etc/nginx/sites-available/default.bak /etc/nginx/sites-available/default; systemctl restart nginx > /dev/null 2>&1; echo -e "${YELLOW}--> Restored old Nginx config.${NC}"; fi; fi
+    systemctl daemon-reload; rm -rf ${FRP_INSTALL_DIR} /etc/letsencrypt
+    if [ -d "/etc/nginx" ]; then if [ -f "/etc/nginx/sites-available/default.bak" ]; then mv /etc/nginx/sites-available/default.bak /etc/nginx/sites-available/default; fi; systemctl restart nginx > /dev/null 2>&1; echo -e "${YELLOW}--> Nginx config restored (if backup existed).${NC}"; fi
     echo -e "${YELLOW}Note: Firewall rules must be removed manually.${NC}"; echo -e "\n${GREEN}SUCCESS! FRP has been uninstalled.${NC}"
 }
 main_menu() {
     while true; do
         clear; CURRENT_SERVER_IP=$(wget -qO- 'https://api.ipify.org' || echo "N/A")
-        echo "================================================="; echo -e "      ${CYAN}APPLOOS FRP TUNNEL${NC} - v62.0"; echo "================================================="
+        echo "================================================="; echo -e "      ${CYAN}APPLOOS FRP TUNNEL${NC} - v63.0"; echo "================================================="
         echo -e "  Developed By ${YELLOW}@AliTabari${NC}"; echo -e "  This Server's Public IP: ${GREEN}${CURRENT_SERVER_IP}${NC}"; check_install_status
         echo "-------------------------------------------------"; echo "  1. Setup/Reconfigure FRP Tunnel"; echo "  2. Uninstall FRP"; echo "  3. Exit"; echo "-------------------------------------------------"
         read -p "Enter your choice [1-3]: " choice
