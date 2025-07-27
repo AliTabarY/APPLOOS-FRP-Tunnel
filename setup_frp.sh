@@ -2,7 +2,7 @@
 
 # ==================================================================================
 #
-#   APPLOOS FRP TUNNEL - Full Management Script (v71.7 - Log Level Fix)
+#   APPLOOS FRP TUNNEL - Full Management Script (v71.8 - EOF Fix)
 #   Developed By: @AliTabari
 #   Purpose: Automate the installation, configuration, and management of FRP.
 #
@@ -113,4 +113,194 @@ setup_iran_server() {
 
         echo -e "${YELLOW}--> Creating SSL security files...${NC}"
         if [ ! -f "${SSL_OPTIONS_FILE}" ]; then
-            tee ${SSL_OPTIONS_FILE} > /dev/null <<'EOF'
+            printf "%s\n" \
+                "ssl_session_cache shared:le_nginx_SSL:10m;" \
+                "ssl_session_timeout 1440m;" \
+                "ssl_session_tickets off;" \
+                "ssl_protocols TLSv1.2 TLSv1.3;" \
+                "ssl_prefer_server_ciphers off;" \
+                "ssl_ciphers \"ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384\";" \
+                > "${SSL_OPTIONS_FILE}"
+        fi
+        if [ ! -f "${SSL_DHPARAMS_FILE}" ]; then
+            echo -e "--> Generating ${SSL_DHPARAMS_FILE} (this may take a minute)...${NC}"; openssl dhparam -out ${SSL_DHPARAMS_FILE} 2048 > /dev/null 2>&1
+        fi
+
+        echo -e "${YELLOW}--> Configuring Nginx as a reverse proxy...${NC}"
+        printf "%s\n" \
+            "server {" \
+            "    listen 80; server_name ${FRP_DOMAIN};" \
+            "    location /.well-known/acme-challenge/ { root /var/www/html; }" \
+            "    location / { return 301 https://\$host\$request_uri; }" \
+            "}" \
+            "server {" \
+            "    listen 443 ssl http2; server_name ${FRP_DOMAIN};" \
+            "    ssl_certificate /etc/letsencrypt/live/${FRP_DOMAIN}/fullchain.pem;" \
+            "    ssl_certificate_key /etc/letsencrypt/live/${FRP_DOMAIN}/privkey.pem;" \
+            "    include ${SSL_OPTIONS_FILE};" \
+            "    ssl_dhparam ${SSL_DHPARAMS_FILE};" \
+            "    location / {" \
+            "        proxy_pass http://127.0.0.1:${FRP_TCP_CONTROL_PORT};" \
+            "        proxy_http_version 1.1;" \
+            "        proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection \"upgrade\"; proxy_set_header Host \$host;" \
+            "    }" \
+            "}" \
+            > /etc/nginx/sites-available/default
+        systemctl start nginx
+
+        # frps.ini for WSS
+        printf "%s\n" \
+            "[common]" \
+            "vhost_http_port = ${FRP_TCP_CONTROL_PORT}" \
+            "subdomain_host = ${FRP_DOMAIN}" \
+            "dashboard_addr = 127.0.0.1" \
+            "dashboard_port = ${FRP_DASHBOARD_PORT}" \
+            "dashboard_user = admin" \
+            "dashboard_pwd = FRP_PASSWORD_123" \
+            "log_file = /var/log/frps.log" \
+            "log_level = info" \
+            "log_max_days = 3" \
+            "token = ${FRP_TOKEN}" \
+            > ${FRP_INSTALL_DIR}/frps.ini
+    else
+        # frps.ini for TCP, KCP, QUIC
+        printf "%s\n" \
+            "[common]" \
+            "bind_port = ${FRP_TCP_CONTROL_PORT}" \
+            "kcp_bind_port = ${FRP_KCP_CONTROL_PORT}" \
+            "quic_bind_port = ${FRP_QUIC_CONTROL_PORT}" \
+            "dashboard_addr = 0.0.0.0" \
+            "dashboard_port = ${FRP_DASHBOARD_PORT}" \
+            "dashboard_user = admin" \
+            "dashboard_pwd = FRP_PASSWORD_123" \
+            "log_file = /var/log/frps.log" \
+            "log_level = info" \
+            "log_max_days = 3" \
+            "token = ${FRP_TOKEN}" \
+            "allow_ports = ${REMOTE_PROXY_START_PORT}-${REMOTE_PROXY_END_PORT}" \
+            "max_pool_count = 5" \
+            "tls_enable = false" \
+            "tcp_mux = ${TCP_MUX}" \
+            > ${FRP_INSTALL_DIR}/frps.ini
+    fi
+
+    echo -e "${YELLOW}--> Setting up firewall...${NC}";
+    # UFW port opening logic
+    ufw allow ${FRP_DASHBOARD_PORT}/tcp > /dev/null # Dashboard always needed
+
+    if [[ "$FRP_PROTOCOL" == "tcp" || "$FRP_PROTOCOL" == "kcp" || "$FRP_PROTOCOL" == "quic" ]]; then 
+        ufw allow ${FRP_TCP_CONTROL_PORT}/tcp > /dev/null; 
+    fi
+    if [[ "$FRP_PROTOCOL" == "kcp" ]]; then 
+        ufw allow ${FRP_KCP_CONTROL_PORT}/udp > /dev/null; 
+    fi
+    if [[ "$FRP_PROTOCOL" == "quic" ]]; then 
+        ufw allow ${FRP_QUIC_CONTROL_PORT}/udp > /dev/null; 
+    fi
+    if [[ "$FRP_PROTOCOL" == "wss" ]]; then 
+        ufw allow 80/tcp > /dev/null; 
+        ufw allow 443/tcp > /dev/null; 
+    fi
+
+    # Allow user-specified tunnel ports
+    OLD_IFS=$IFS; IFS=','; read -ra PORTS_ARRAY <<< "$FRP_TUNNEL_PORTS_UFW"; IFS=$OLD_IFS
+    for port in "${PORTS_ARRAY[@]}"; do 
+        ufw allow "$port"/tcp > /dev/null; 
+        ufw allow "$port"/udp > /dev/null; 
+    done
+    ufw reload > /dev/null
+
+    # Systemd service creation for frps
+    local service_config="[Unit]\nDescription=FRP Server (frps)\nAfter=network.target\n\n[Service]\nType=simple\nUser=root\nRestart=on-failure\nRestartSec=5s\nExecStart=${FRP_INSTALL_DIR}/frps -c ${FRP_INSTALL_DIR}/frps.ini\n\n[Install]\nWantedBy=multi-user.target"
+    printf "%b" "${service_config}" > ${SYSTEMD_DIR}/frps.service
+    systemctl daemon-reload; systemctl enable frps.service > /dev/null; systemctl restart frps.service
+    echo -e "\n${GREEN}SUCCESS! Iran Server setup is complete.${NC}"
+}
+setup_foreign_server() {
+    get_server_ips && get_port_input && get_protocol_choice || return 1
+    echo -e "\n${YELLOW}--- Setting up Foreign Server (frpc) ---${NC}"; stop_frp_processes; download_and_extract
+
+    local frpc_config_common
+    printf -v frpc_config_common "%s\n" \
+        "[common]" \
+        "server_addr = ${IRAN_SERVER_IP}" \
+        "log_file = /var/log/frpc.log" \
+        "log_level = info" \
+        "log_max_days = 3" \
+        "token = ${FRP_TOKEN}"
+
+    local frpc_config_protocol=""
+    # Protocol-specific common settings
+    if [[ "$FRP_PROTOCOL" == "tcp" || "$FRP_PROTOCOL" == "kcp" || "$FRP_PROTOCOL" == "quic" ]]; then 
+        printf -v frpc_config_protocol "%s\n" \
+            "server_port = ${FRP_TCP_CONTROL_PORT}" \
+            "tcp_mux = ${TCP_MUX}" # TCP_MUX based on user choice
+    fi
+
+    case $FRP_PROTOCOL in
+        "tcp") 
+            frpc_config_protocol+=$'\n'"transport.protocol = tcp" 
+            ;;
+        "kcp") 
+            frpc_config_protocol+=$'\n'"transport.protocol = kcp"$'\n'"mtu = 1280" # mtud added back for KCP as it was there originally
+            ;;
+        "quic") 
+            frpc_config_protocol+=$'\n'"transport.protocol = quic"$'\n'"mtu = 1280"$'\n'"tls_verify_server_cert = false" # mtud and tls_verify_server_cert added back for QUIC
+            ;;
+        "wss") 
+            frpc_config_protocol=$'\n'"server_port = 443"$'\n'"transport.protocol = wss"$'\n'"tls_enable = true"$'\n'"server_name = ${FRP_DOMAIN}" 
+            ;;
+    esac
+
+    local frpc_config_proxies=""
+    printf -v frpc_config_proxies "%s\n" \
+        "" \
+        "[range:tcp_proxies]" \
+        "type = tcp" \
+        "local_ip = 127.0.0.1" \
+        "local_port = ${FRP_TUNNEL_PORTS_FRP}" \
+        "remote_port = ${FRP_TUNNEL_PORTS_FRP}" \
+        "" \
+        "[range:udp_proxies]" \
+        "type = udp" \
+        "local_ip = 127.0.0.1" \
+        "local_port = ${FRP_TUNNEL_PORTS_FRP}" \
+        "remote_port = ${FRP_TUNNEL_PORTS_FRP}"
+
+    printf "%s\n%s\n%s\n" "${frpc_config_common}" "${frpc_config_protocol}" "${frpc_config_proxies}" > ${FRP_INSTALL_DIR}/frpc.ini
+
+    local service_config="[Unit]\nDescription=FRP Client (frpc)\nAfter=network.target\n\n[Service]\nType=simple\nUser=root\nRestart=on-failure\nRestartSec=5s\nExecStart=${FRP_INSTALL_DIR}/frpc -c ${FRP_INSTALL_DIR}/frpc.ini\n\n[Install]\nWantedBy=multi-user.target"
+    printf "%b" "${service_config}" > ${SYSTEMD_DIR}/frpc.service
+    systemctl daemon-reload; systemctl enable frpc.service > /dev/null; systemctl restart frpc.service
+    echo -e "\n${GREEN}SUCCESS! Foreign Server setup is complete.${NC}"
+}
+uninstall_frp() {
+    echo -e "\n${YELLOW}Uninstalling FRP...${NC}"; stop_frp_processes
+    systemctl disable frps.service > /dev/null 2>&1; systemctl disable frpc.service > /dev/null 2>&1
+    rm -f ${SYSTEMD_DIR}/frps.service; rm -f ${SYSTEMD_DIR}/frpc.service
+    systemctl daemon-reload; rm -rf ${FRP_INSTALL_DIR} /etc/letsencrypt
+    if [ -d "/etc/nginx" ]; then if [ -f "/etc/nginx/sites-available/default.bak" ]; then mv /etc/nginx/sites-available/default.bak /etc/nginx/sites-available/default; fi; systemctl restart nginx > /dev/null 2>&1; echo -e "${YELLOW}--> Nginx config restored.${NC}"; fi
+    echo -e "${YELLOW}Note: Firewall rules must be removed manually.${NC}"; echo -e "\n${GREEN}SUCCESS! FRP has been uninstalled.${NC}"
+}
+main_menu() {
+    while true; do
+        clear; CURRENT_SERVER_IP=$(wget -qO- 'https://api.ipify.org' || echo "N/A")
+        echo "================================================="; echo -e "      ${CYAN}APPLOOS FRP TUNNEL${NC} - v71.8"; echo "================================================="
+        echo -e "  Developed By ${YELLOW}@AliTabari${NC}"; echo -e "  This Server's Public IP: ${GREEN}${CURRENT_SERVER_IP}${NC}"; check_install_status
+        echo "-------------------------------------------------"; echo "  1. Setup/Reconfigure FRP Tunnel"; echo "  2. Uninstall FRP"; echo "  3. Exit"; echo "-------------------------------------------------"
+        read -p "Enter your choice [1-3]: " choice
+        case $choice in
+            1)
+                echo -e "\n${CYAN}Which machine is this?${NC}"; echo "  1. IRAN Server (Public Entry)"; echo "  2. FOREIGN Server (Service Host)"
+                read -p "Enter choice [1-2]: " setup_choice
+                if [[ "$setup_choice" == "1" ]]; then setup_iran_server; elif [[ "$setup_choice" == "2" ]]; then setup_foreign_server; else echo -e "${RED}Invalid choice.${NC}"; fi
+                ;;
+            2) uninstall_frp ;;
+            3) echo -e "${YELLOW}Exiting.${NC}"; exit 0 ;;
+            *) echo -e "${RED}Invalid choice.${NC}"; sleep 2 ;;
+        esac
+        echo -e "\n${CYAN}Operation complete. Press [Enter] to return...${NC}"; read
+    done
+}
+check_root
+main_menu
